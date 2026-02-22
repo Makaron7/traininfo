@@ -65,3 +65,6 @@ local.properties
 
 # OS
 Thumbs.db
+
+# Android emulator bugreport artifacts
+bugreport-*.zip
