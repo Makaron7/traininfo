@@ -1,8 +1,11 @@
 import { useCallback, useRef, useState } from 'react';
+import { Alert, Platform } from 'react-native';
 import * as Location from 'expo-location';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AppSettings, Station, TRACKING_CONFIG, TrainLine } from './train-types';
+import { computeAverageStationSpacing, computeEffectiveArrivalThreshold } from './arrival-threshold';
 
-type Coords = { latitude: number; longitude: number };
+type LocationSample = { latitude: number; longitude: number; speedMps?: number | null };
 
 type DynamicMode = 'near' | 'mid' | 'far';
 
@@ -12,6 +15,8 @@ type UseLocationTrackingParams = {
   settings: AppSettings;
   onArrive: (stationName: string) => void;
 };
+
+const BACKGROUND_LOCATION_TASK = 'background-location-task';
 
 const getDistanceFromLatLonInMeters = (lat1: number, lon1: number, lat2: number, lon2: number): number => {
   const radius = TRACKING_CONFIG.EARTH_RADIUS;
@@ -33,10 +38,12 @@ export const useLocationTracking = ({ selectedStation, selectedLine, settings, o
   const [currentStationIndex, setCurrentStationIndex] = useState(-1);
   const [nearestStationDistance, setNearestStationDistance] = useState<number | null>(null);
 
-  const locationSubscription = useRef<Location.LocationSubscription | null>(null);
   const trackingMode = useRef<DynamicMode>('near');
   const stationSwitchCandidate = useRef<{ idx: number; hits: number }>({ idx: -1, hits: 0 });
   const hasDepartedFromCurrentStation = useRef(false);
+  const hasTriggeredArrivalNotification = useRef(false);
+  const foregroundWatchSubscription = useRef<Location.LocationSubscription | null>(null);
+  const lineAverageSpacing = useRef<number | null>(null);
 
   const resolveModeByDistance = (targetDistance: number): DynamicMode => {
     if (targetDistance > TRACKING_CONFIG.DYNAMIC_FAR_DISTANCE) return 'far';
@@ -45,14 +52,9 @@ export const useLocationTracking = ({ selectedStation, selectedLine, settings, o
   };
 
   const subscribeWithMode = useCallback(async (mode: DynamicMode) => {
-    if (locationSubscription.current) {
-      locationSubscription.current.remove();
-      locationSubscription.current = null;
-    }
-
     trackingMode.current = mode;
 
-    const options =
+    const baseOptions =
       mode === 'far'
         ? {
             accuracy: Location.Accuracy.Balanced,
@@ -71,18 +73,36 @@ export const useLocationTracking = ({ selectedStation, selectedLine, settings, o
               distanceInterval: TRACKING_CONFIG.GPS_DISTANCE_FILTER_NEAR,
             };
 
-    locationSubscription.current = await Location.watchPositionAsync(options, (location) => {
-      void updateLocation(location.coords);
-    });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedStation, selectedLine, currentStationIndex, settings.arrivalThreshold, onArrive]);
+      const platformOptions = Platform.select<Partial<Location.LocationTaskOptions>>({
+        android: {
+          foregroundService: {
+            notificationTitle: 'アラーム実行中',
+            notificationBody: '目的地に向かっています',
+          },
+        },
+        ios: {
+          showsBackgroundLocationIndicator: true,
+        },
+        default: {},
+      });
 
-  const updateLocation = useCallback(async (coords: Coords) => {
+      const started = await Location.hasStartedLocationUpdatesAsync(BACKGROUND_LOCATION_TASK);
+      if (started) {
+        await Location.stopLocationUpdatesAsync(BACKGROUND_LOCATION_TASK);
+      }
+
+      await Location.startLocationUpdatesAsync(BACKGROUND_LOCATION_TASK, {
+        ...baseOptions,
+        ...platformOptions,
+      });
+    }, []);
+
+  const updateLocation = useCallback(async (sample: LocationSample) => {
     if (!selectedStation || !selectedLine) return;
 
     const dist = getDistanceFromLatLonInMeters(
-      coords.latitude,
-      coords.longitude,
+      sample.latitude,
+      sample.longitude,
       selectedStation.latitude,
       selectedStation.longitude,
     );
@@ -93,17 +113,26 @@ export const useLocationTracking = ({ selectedStation, selectedLine, settings, o
       await subscribeWithMode(nextMode);
     }
 
-    const arrivalThreshold = settings.arrivalThreshold ?? TRACKING_CONFIG.ARRIVAL_THRESHOLD_DEFAULT;
+    const baseArrivalThreshold = settings.arrivalThreshold ?? TRACKING_CONFIG.ARRIVAL_THRESHOLD_DEFAULT;
+    const effectiveArrivalThreshold = computeEffectiveArrivalThreshold(
+      baseArrivalThreshold,
+      sample.speedMps,
+      lineAverageSpacing.current,
+    );
     const justArrivedThreshold = TRACKING_CONFIG.CURRENT_STATION_THRESHOLD;
-    const departThreshold = Math.max(arrivalThreshold + 150, TRACKING_CONFIG.DEPARTURE_THRESHOLD);
+    const departThreshold = Math.max(effectiveArrivalThreshold + 150, TRACKING_CONFIG.DEPARTURE_THRESHOLD);
 
-    if (dist <= justArrivedThreshold && !isArrived) {
+    if (dist <= justArrivedThreshold) {
       setIsArrived(true);
-      onArrive(selectedStation.name);
-    } else if (dist <= arrivalThreshold) {
+      if (!hasTriggeredArrivalNotification.current) {
+        onArrive(selectedStation.name);
+        hasTriggeredArrivalNotification.current = true;
+      }
+    } else if (dist <= effectiveArrivalThreshold) {
       setIsArrived(true);
     } else if (dist > departThreshold) {
       setIsArrived(false);
+      hasTriggeredArrivalNotification.current = false;
     }
 
     const stations = selectedLine.stations;
@@ -122,8 +151,8 @@ export const useLocationTracking = ({ selectedStation, selectedLine, settings, o
     for (let index = start; index < end; index += 1) {
       const station = stations[index];
       const stationDistance = getDistanceFromLatLonInMeters(
-        coords.latitude,
-        coords.longitude,
+        sample.latitude,
+        sample.longitude,
         station.latitude,
         station.longitude,
       );
@@ -169,27 +198,98 @@ export const useLocationTracking = ({ selectedStation, selectedLine, settings, o
       hasDepartedFromCurrentStation.current = true;
       stationSwitchCandidate.current = { idx: -1, hits: 0 };
     }
-  }, [currentStationIndex, isArrived, isTracking, onArrive, selectedLine, selectedStation, settings.arrivalThreshold, subscribeWithMode]);
+  }, [currentStationIndex, isTracking, onArrive, selectedLine, selectedStation, settings.arrivalThreshold, subscribeWithMode]);
 
   const startTracking = useCallback(async () => {
-    if (!selectedStation) return;
-    setIsTracking(true);
-    setIsArrived(false);
-    stationSwitchCandidate.current = { idx: -1, hits: 0 };
-    hasDepartedFromCurrentStation.current = false;
-    await subscribeWithMode('near');
-  }, [selectedStation, subscribeWithMode]);
+    if (!selectedStation || !selectedLine) {
+      return;
+    }
+
+    try {
+      const fgPermission = await Location.getForegroundPermissionsAsync();
+      const bgPermission = await Location.getBackgroundPermissionsAsync();
+
+      if (fgPermission.status !== 'granted' || bgPermission.status !== 'granted') {
+        Alert.alert(
+          '権限エラー',
+          '位置情報が「常に許可」になっていません。設定アプリから位置情報権限を変更してください。',
+        );
+        return;
+      }
+
+      lineAverageSpacing.current = computeAverageStationSpacing(selectedLine.stations);
+
+      await Promise.all([
+        AsyncStorage.setItem('SelectedTargetStation', JSON.stringify(selectedStation)),
+        AsyncStorage.setItem(
+          'SelectedLineMeta',
+          JSON.stringify({ averageStationSpacing: lineAverageSpacing.current }),
+        ),
+      ]);
+      setIsTracking(true);
+      setIsArrived(false);
+      hasTriggeredArrivalNotification.current = false;
+      stationSwitchCandidate.current = { idx: -1, hits: 0 };
+      hasDepartedFromCurrentStation.current = false;
+
+      await subscribeWithMode('near');
+
+      if (foregroundWatchSubscription.current) {
+        foregroundWatchSubscription.current.remove();
+        foregroundWatchSubscription.current = null;
+      }
+
+      foregroundWatchSubscription.current = await Location.watchPositionAsync(
+        {
+          accuracy: Location.Accuracy.High,
+          timeInterval: TRACKING_CONFIG.GPS_INTERVAL_NEAR_MS,
+          distanceInterval: TRACKING_CONFIG.GPS_DISTANCE_FILTER_NEAR,
+        },
+        (location) => {
+          void updateLocation({
+            latitude: location.coords.latitude,
+            longitude: location.coords.longitude,
+            speedMps: location.coords.speed,
+          });
+        },
+      );
+
+      const current = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.High,
+      });
+      await updateLocation({
+        latitude: current.coords.latitude,
+        longitude: current.coords.longitude,
+        speedMps: current.coords.speed,
+      });
+    } catch (error: unknown) {
+      setIsTracking(false);
+      const message = error instanceof Error ? error.message : '不明なエラーが発生しました';
+      Alert.alert('トラッキング起動エラー', message);
+    }
+  }, [selectedLine, selectedStation, subscribeWithMode, updateLocation]);
 
   const stopTracking = useCallback(async () => {
-    if (locationSubscription.current) {
-      locationSubscription.current.remove();
-      locationSubscription.current = null;
+    if (foregroundWatchSubscription.current) {
+      foregroundWatchSubscription.current.remove();
+      foregroundWatchSubscription.current = null;
     }
+
+    const started = await Location.hasStartedLocationUpdatesAsync(BACKGROUND_LOCATION_TASK);
+    if (started) {
+      await Location.stopLocationUpdatesAsync(BACKGROUND_LOCATION_TASK);
+    }
+    await Promise.all([
+      AsyncStorage.removeItem('SelectedTargetStation'),
+      AsyncStorage.removeItem('SelectedLineMeta'),
+    ]);
+    lineAverageSpacing.current = null;
     setIsTracking(false);
     setDistance(null);
     setIsArrived(false);
     setCurrentStationIndex(-1);
     setNearestStationDistance(null);
+    hasTriggeredArrivalNotification.current = false;
     stationSwitchCandidate.current = { idx: -1, hits: 0 };
     hasDepartedFromCurrentStation.current = false;
   }, []);

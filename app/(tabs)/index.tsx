@@ -20,7 +20,7 @@ import { useLocationTracking } from '@/hooks/useLocationTracking';
 import { useNotification } from '@/hooks/useNotification';
 import { Station, TrainLine } from '@/hooks/train-types';
 import { useTrainData } from '@/hooks/useTrainData';
-import { TrainLCD as TrainLCDView } from '@/features/train/TrainLCD';
+import { TrainLCD as TrainLCDView } from '../../features/train/TrainLCD';
 import { Colors } from '@/features/train/theme';
 import { getLineColor } from '@/features/train/constants';
 
@@ -47,12 +47,14 @@ export default function App() {
   const theme = Colors[colorScheme === 'dark' ? 'dark' : 'light'];
   
   const {
+    savedLines,
     isLoadingAPI,
     foundLines,
     setFoundLines,
     loadLines,
     searchLinesFromStation: searchLinesFromStationApi,
     downloadLine: downloadLineApi,
+    deleteLine,
   } = useTrainData({ resolveLineColor: getLineColor });
 
   const [selectedLine, setSelectedLine] = useState<TrainLine | null>(null);
@@ -97,6 +99,15 @@ export default function App() {
   useEffect(() => {
     loadLines();
   }, [loadLines]);
+
+  useEffect(() => {
+    if (!selectedLine) return;
+    const exists = savedLines.some((line) => line.id === selectedLine.id);
+    if (!exists) {
+      setSelectedLine(null);
+      setSelectedStation(null);
+    }
+  }, [savedLines, selectedLine]);
 
   // 通知受信時に確実にハプティクスを鳴らす（フォアグラウンドでも発火）
   useEffect(() => {
@@ -170,6 +181,50 @@ export default function App() {
     <SafeAreaView style={[styles.container, { backgroundColor: theme.bg }]}> 
       <StatusBar barStyle={colorScheme === 'dark' ? 'light-content' : 'dark-content'} />
 
+      <View style={styles.header}>
+        <Text style={[styles.headerTitle, { color: theme.text }]}>Train Info</Text>
+        <TouchableOpacity onPress={() => setModalVisible(true)}>
+          <Text style={styles.addText}>＋</Text>
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.section}>
+        <Text style={[styles.sectionTitle, { color: theme.text }]}>保存路線</Text>
+        {savedLines.length === 0 ? (
+          <Text style={[styles.emptyText, { color: theme.subText }]}>路線データがありません</Text>
+        ) : (
+          <FlatList
+            data={savedLines}
+            horizontal
+            keyExtractor={(item) => item.id}
+            showsHorizontalScrollIndicator={false}
+            renderItem={({ item }) => {
+              const isSelected = selectedLine?.id === item.id;
+              return (
+                <TouchableOpacity
+                  style={[
+                    styles.lineCard,
+                    { backgroundColor: item.color, opacity: isSelected ? 1 : 0.82 },
+                  ]}
+                  onPress={() => {
+                    setSelectedLine(item);
+                    setSelectedStation(null);
+                  }}
+                >
+                  <TouchableOpacity
+                    style={styles.deleteBadge}
+                    onPress={() => deleteLine(item.id)}
+                  >
+                    <Text style={styles.deleteText}>×</Text>
+                  </TouchableOpacity>
+                  <Text style={[styles.cardText, styles.selectedCardText]} numberOfLines={2}>{item.name}</Text>
+                </TouchableOpacity>
+              );
+            }}
+          />
+        )}
+      </View>
+
       {selectedLine && selectedStation && distance !== null && (
         <View style={styles.lcdWrapper}>
           <TrainLCDView
@@ -183,12 +238,6 @@ export default function App() {
             nearestStationDistance={nearestStationDistance}
             theme={theme}
           />
-        </View>
-      )}
-
-      {!selectedLine && (
-        <View style={styles.section}>
-          <Text style={[styles.emptyText, { color: theme.subText }]}>路線データがありません</Text>
         </View>
       )}
 

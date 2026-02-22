@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useRef } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { Station } from '@/hooks/train-types';
 import { CONFIG, getStationNumber } from './constants';
@@ -23,42 +23,79 @@ export function TrainLCD({ targetStation, distance, lineName, lineColor, station
   const targetIdx = stations.findIndex((station) => station.id === targetStation.id);
   const hasValidCurrentIndex = currentStationIndex >= 0 && currentStationIndex < stations.length;
   const isReverse = hasValidCurrentIndex && targetIdx >= 0 ? currentStationIndex > targetIdx : false;
-  let nextIdx = isReverse ? currentStationIndex - 1 : currentStationIndex + 1;
 
-  if (!hasValidCurrentIndex && targetIdx >= 0) nextIdx = targetIdx;
+  // --- 【修正】完全に停車した駅を記憶する ---
+  const visualLastIdxRef = useRef<number>(currentStationIndex);
+  
+  if (visualLastIdxRef.current < 0 && currentStationIndex >= 0) {
+    visualLastIdxRef.current = currentStationIndex;
+  }
+
+  // ★目的駅に到着した（75m以内）場合は、シミュレーターのラグを防ぐため強制的にターゲット駅を記憶
+  if (distance !== null && distance <= 75) {
+    visualLastIdxRef.current = targetIdx;
+  } 
+  // 通常の駅で75m以内に止まった場合
+  else if (nearestStationDistance !== null && nearestStationDistance <= 75 && currentStationIndex >= 0) {
+    visualLastIdxRef.current = currentStationIndex;
+  }
+
+  let vIdx = Math.max(0, visualLastIdxRef.current);
+  if (vIdx >= stations.length) vIdx = stations.length - 1;
+
+  let nextIdx = isReverse ? vIdx - 1 : vIdx + 1;
   if (nextIdx < 0) nextIdx = 0;
   if (nextIdx >= stations.length) nextIdx = stations.length - 1;
-  if ((!isReverse && nextIdx > targetIdx) || (isReverse && nextIdx < targetIdx)) nextIdx = targetIdx;
 
-  const nextStation = stations.length > 0 && nextIdx >= 0 ? stations[nextIdx] : targetStation;
-  const isBetweenStations = nearestStationDistance !== null && nearestStationDistance > CONFIG.CURRENT_STATION_THRESHOLD;
-  const currentStation = hasValidCurrentIndex ? stations[currentStationIndex] : null;
-  const isStoppedAtStation = nearestStationDistance !== null && nearestStationDistance <= CONFIG.STOPPED_STATION_THRESHOLD;
-  const isCurrentStopMode = isStoppedAtStation && !!currentStation;
-  const isApproachingStation = !isCurrentStopMode && nearestStationDistance !== null && nearestStationDistance > CONFIG.STOPPED_STATION_THRESHOLD && nearestStationDistance <= CONFIG.CURRENT_STATION_THRESHOLD;
-  const isCurrentStopAtTarget = isCurrentStopMode && currentStation?.id === targetStation.id;
-  const mainDisplayStation = isCurrentStopMode && currentStation ? currentStation : nextStation;
+  const isActuallyStopped = nearestStationDistance !== null && nearestStationDistance <= 75;
 
+  // --- 表示するテキストと駅の決定 ---
   let headerTextJa = '次は';
   let headerTextEn = 'Next';
   let labelColor = theme.lcdSubText;
+  let mainDisplayStation = stations[nextIdx];
+  let stationAfterCurrent: Station | null = null;
 
-  if (isCurrentStopMode) {
+  // ★最強のオーバーライド：目的地への距離が280m以内なら、強制的に目的地を主役にする！
+  if (distance !== null && distance <= 280) {
+    mainDisplayStation = targetStation;
+    
+    if (distance <= 75) {
+      // 到着した瞬間（0mボタンを押した時など）
+      headerTextJa = 'ただいま';
+      headerTextEn = 'Current Station';
+      labelColor = '#ff3b30'; // 赤色
+    } else {
+      // 280m〜75mの間（100m, 200mボタンを押した時など）
+      headerTextJa = 'まもなく';
+      headerTextEn = 'Arriving';
+      labelColor = '#ff9500'; // オレンジ色
+    }
+  } else if (isActuallyStopped) {
+    // 目的地以外での完全停車中（中間駅）
+    mainDisplayStation = stations[vIdx];
     headerTextJa = 'ただいま';
     headerTextEn = 'Current Station';
-    labelColor = isCurrentStopAtTarget ? '#ff3b30' : theme.lcdSubText;
-  } else if (isApproachingStation) {
-    headerTextJa = 'まもなく';
-    headerTextEn = 'Arriving';
-    labelColor = '#ff9500';
+    labelColor = theme.lcdSubText;
+    stationAfterCurrent = stations[nextIdx];
+  } else {
+    // 目的地以外の駅間を走行中
+    mainDisplayStation = stations[nextIdx];
+    headerTextJa = '次は';
+    headerTextEn = 'Next';
+    labelColor = theme.lcdSubText;
   }
 
+  const mainDisplayNumber = getStationNumber(lineName, mainDisplayStation.name);
   const targetNumber = getStationNumber(lineName, targetStation.name);
   const displayTargetStr = targetNumber ? `${targetStation.name} (${targetNumber})` : targetStation.name;
-  const displayNumberStr = getStationNumber(lineName, mainDisplayStation.name);
-  const stationAfterCurrent = isCurrentStopMode && currentStation && nextStation.id !== currentStation.id ? nextStation : null;
+  const displayNumberStr = mainDisplayNumber ? `(${mainDisplayNumber})` : '';
 
-  const startIdx = isReverse ? currentStationIndex + 1 : currentStationIndex - 1;
+  // 目的駅に到着しているかどうかの判定
+  const isCurrentStopAtTarget = (distance !== null && distance <= 75) || (isActuallyStopped && mainDisplayStation.id === targetStation.id);
+
+  // --- 路線図（ドットと線）の計算 ---
+  const startIdx = isReverse ? nextIdx + 1 : nextIdx - 1;
   const count = Math.min(CONFIG.LCD_DISPLAY_COUNT, stations.length);
   const displayStations: (DisplayStation | null)[] = [];
 
@@ -71,20 +108,27 @@ export function TrainLCD({ targetStation, distance, lineName, lineColor, station
 
     const station = stations[stationIndex];
     let status: 'passed' | 'current' | 'future' = 'future';
-    if (!isBetweenStations && stationIndex === currentStationIndex) status = 'current';
-    if (isReverse) {
-      if (stationIndex > currentStationIndex || (isBetweenStations && stationIndex === currentStationIndex)) status = 'passed';
-    } else if (stationIndex < currentStationIndex || (isBetweenStations && stationIndex === currentStationIndex)) {
-      status = 'passed';
+
+    if (isActuallyStopped && stationIndex === vIdx) {
+      status = 'current';
+    } else {
+      if (isReverse) {
+        if (stationIndex >= (isActuallyStopped ? vIdx + 1 : vIdx)) status = 'passed';
+      } else {
+        if (stationIndex <= (isActuallyStopped ? vIdx - 1 : vIdx)) status = 'passed';
+      }
     }
     displayStations.push({ ...station, status });
   }
 
-  const currentDisplayIdx = displayStations.findIndex((station) => station?.id === currentStation?.id);
-  const nextDisplayIdx = displayStations.findIndex((station) => station?.id === nextStation.id);
+  // ポインター（▶）の位置計算
+  const isBetweenStationsVisual = !isActuallyStopped;
+  const lastPassedDisplayIdx = displayStations.findIndex((s) => s?.id === stations[vIdx].id);
+  const nextDisplayIdx = displayStations.findIndex((s) => s?.id === stations[nextIdx].id);
+
   const betweenSegmentStartIdx =
-    isBetweenStations && currentDisplayIdx >= 0 && nextDisplayIdx >= 0 && Math.abs(currentDisplayIdx - nextDisplayIdx) === 1
-      ? Math.min(currentDisplayIdx, nextDisplayIdx)
+    isBetweenStationsVisual && lastPassedDisplayIdx >= 0 && nextDisplayIdx >= 0 && Math.abs(lastPassedDisplayIdx - nextDisplayIdx) === 1
+      ? Math.min(lastPassedDisplayIdx, nextDisplayIdx)
       : -1;
 
   return (
@@ -104,7 +148,7 @@ export function TrainLCD({ targetStation, distance, lineName, lineColor, station
         <View style={{ flexDirection: 'row', alignItems: 'baseline' }}>
           <Text style={[styles.lcdStationNameSub, { color: theme.lcdSubText }]}>{mainDisplayStation.name} Station</Text>
           {displayNumberStr ? (
-            <Text style={[styles.lcdStationNameSub, { color: theme.lcdSubText, marginLeft: 8, fontWeight: 'bold' }]}>({displayNumberStr})</Text>
+            <Text style={[styles.lcdStationNameSub, { color: theme.lcdSubText, marginLeft: 8, fontWeight: 'bold' }]}>{displayNumberStr}</Text>
           ) : null}
         </View>
 
@@ -140,7 +184,7 @@ export function TrainLCD({ targetStation, distance, lineName, lineColor, station
 
             const nextNode = index < count - 1 ? displayStations[index + 1] : null;
             const isActiveByStatus = !!nextNode && station.status !== 'passed' && nextNode.status !== 'passed';
-            const isActiveBetween = isBetweenStations && index === betweenSegmentStartIdx;
+            const isActiveBetween = isBetweenStationsVisual && index === betweenSegmentStartIdx;
 
             return (
               <View key={index} style={styles.stationNode}>
@@ -151,7 +195,7 @@ export function TrainLCD({ targetStation, distance, lineName, lineColor, station
                   </>
                 )}
 
-                {isBetweenStations && index === betweenSegmentStartIdx && (
+                {isBetweenStationsVisual && index === betweenSegmentStartIdx && (
                   <View style={[styles.pointerMarker, { left: '100%', borderColor: themeColor, backgroundColor: theme.lcdBg }]}>
                     <Text style={[styles.pointerGlyph, { color: themeColor }]}>{isReverse ? '◀' : '▶'}</Text>
                   </View>
@@ -171,7 +215,7 @@ export function TrainLCD({ targetStation, distance, lineName, lineColor, station
 
       <View style={[styles.lcdDistanceBox, { backgroundColor: '#1c1c1e' }]}>
         <Text style={styles.lcdDistanceLabel}>{displayTargetStr} まで およそ</Text>
-        <Text style={styles.lcdDistanceValue}>{isStoppedAtStation && isCurrentStopAtTarget ? '到着' : `${distance} m`}</Text>
+        <Text style={styles.lcdDistanceValue}>{isCurrentStopAtTarget ? '到着' : `${distance} m`}</Text>
       </View>
     </View>
   );

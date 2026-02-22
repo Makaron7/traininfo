@@ -14,10 +14,18 @@ export const useAppPermissions = ({ androidChannelId, vibrationPattern }: UseApp
 
   const requestPermissions = useCallback(async () => {
     try {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
+      const { status: fgStatus } = await Location.requestForegroundPermissionsAsync();
+      if (fgStatus !== 'granted') {
         Alert.alert('権限エラー', '位置情報の使用を許可してください');
         return;
+      }
+
+      const { status: bgStatus } = await Location.requestBackgroundPermissionsAsync();
+      if (bgStatus !== 'granted') {
+        Alert.alert(
+          'バックグラウンド権限が必要',
+          'アプリを閉じてもアラームを鳴らすために、設定から位置情報を「常に許可」にしてください。',
+        );
       }
 
       const notificationResult = await Notifications.requestPermissionsAsync();
@@ -32,8 +40,8 @@ export const useAppPermissions = ({ androidChannelId, vibrationPattern }: UseApp
           sound: 'default',
         });
       }
-    } catch {
-      // no-op
+    } catch (e) {
+      console.warn('Permission Error:', e);
     }
   }, [androidChannelId, vibrationPattern]);
 
